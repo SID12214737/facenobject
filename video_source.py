@@ -1,9 +1,13 @@
+import cv2
+import socket, pickle, struct, cv2, numpy as np
+
 class VideoSource:
     def read(self):
         """Return the next frame (BGR np.array) or None if no frame."""
         raise NotImplementedError
-
-import cv2
+    def release(self):
+        """Release any resources if needed."""
+        pass
 
 class CameraSource(VideoSource):
     def __init__(self, index=0):
@@ -13,10 +17,11 @@ class CameraSource(VideoSource):
         ret, frame = self.cap.read()
         return frame if ret else None
 
-import socket, pickle, struct, cv2, numpy as np
+    def release(self):
+        self.cap.release()
 
 class SocketSource(VideoSource):
-    def __init__(self, host='0.0.0.0', port=9999):
+    def __init__(self, host='0.0.0.0', port=9998):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((host, port))
         self.server_socket.listen(1)
@@ -43,6 +48,41 @@ class SocketSource(VideoSource):
         data = data[msg_size:]
         frame = pickle.loads(frame_data)
         return cv2.imdecode(frame, cv2.IMREAD_COLOR)
+    
+    def release(self):
+        self.conn.close()
+        self.server_socket.close()
+
+class SocketClientSource(VideoSource):
+    def __init__(self, host='192.168.0.42', port=9998):  # robot’s IP
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"[INFO] Connecting to {host}:{port}...")
+        self.client_socket.connect((host, port))
+        print("[INFO] Connected to video server.")
+
+    def read(self):
+        data = b""
+        payload_size = struct.calcsize("Q")
+
+        while len(data) < payload_size:
+            packet = self.client_socket.recv(4096)
+            if not packet:
+                return None
+            data += packet
+
+        packed_msg_size = data[:payload_size]
+        data = data[payload_size:]
+        msg_size = struct.unpack("Q", packed_msg_size)[0]
+
+        while len(data) < msg_size:
+            data += self.client_socket.recv(4096)
+
+        frame_data = data[:msg_size]
+        frame = pickle.loads(frame_data)
+        return cv2.imdecode(frame, cv2.IMREAD_COLOR)
+    
+    def release(self):
+        self.client_socket.close()  
 
 # import rclpy
 # from rclpy.node import Node
@@ -68,3 +108,15 @@ class SocketSource(VideoSource):
 
 #     def read(self):
 #         return self.frame_queue.get()
+
+def get_video_source(mode="camera"):
+    if mode == "camera":
+        return CameraSource(0)
+    elif mode == "socket":
+        return SocketSource('0.0.0.0', 9999)
+    elif mode == "socket-client":
+        return SocketClientSource('0.0.0.0', 9999)
+    # elif mode == "ros2":
+    #     return ROS2ImageSource('/camera/image_raw')
+    else:
+        raise ValueError("Invalid mode")

@@ -25,10 +25,6 @@ for name, path in known_images.items():
 
 print(f"[INFO] Loaded {len(known_faces)} known faces.")
 
-# --- Open webcam ---
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
 def detect_blink(landmarks, prev_state=None):
     # Using eye aspect ratio (EAR)
     def eye_ratio(p):
@@ -157,24 +153,29 @@ def detect_faces_and_objects(frame):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
     return frame
 
+def main():
+    # --- Open webcam ---
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-while True:
-    for _ in range(3):  # discard buffered frames
-        cap.grab()
+    while True:
+        for _ in range(3):  # discard buffered frames
+            cap.grab()
 
-    ret, frame = cap.read()
-    if not ret:
-        break
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    frame = detect_faces_and_objects(frame)
+        frame = detect_faces_and_objects(frame)
 
-    cv2.imshow("Face & Object Detection", frame)
+        cv2.imshow("Face & Object Detection", frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-cap.release()
-cv2.destroyAllWindows()
+    cap.release()
+    cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
-    pass
+    main()
