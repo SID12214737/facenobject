@@ -40,10 +40,11 @@ class SocketSource(VideoSource):
         packed_msg_size = data[:payload_size]
         data = data[payload_size:]
         msg_size = struct.unpack("Q", packed_msg_size)[0]
-
+        print(f"[DEBUG] Expecting frame of size: {msg_size} bytes")
         while len(data) < msg_size:
             data += self.conn.recv(4*1024)
-
+            print('stuck')
+        print(f"[DEBUG] Received {len(data)} bytes of frame data")
         frame_data = data[:msg_size]
         data = data[msg_size:]
         frame = pickle.loads(frame_data)
@@ -84,6 +85,38 @@ class SocketClientSource(VideoSource):
     def release(self):
         self.client_socket.close()  
 
+
+class UDPSocketSource(VideoSource):
+    def __init__(self, host='0.0.0.0', port=9999, max_dgram=2**16 - 64):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((host, port))
+        self.sock.settimeout(0.5)
+        self.max_dgram = max_dgram
+        self.buffer = b""
+        print(f"[INFO] Listening for UDP stream on {host}:{port}")
+
+    def read(self):
+        try:
+            while True:
+                segment, _ = self.sock.recvfrom(self.max_dgram)
+                if segment == b'FRAME_END':
+                    if not self.buffer:
+                        return None
+                    frame = pickle.loads(self.buffer)
+                    frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                    self.buffer = b""
+                    return frame
+                else:
+                    self.buffer += segment
+        except socket.timeout:
+            return None
+        except Exception as e:
+            print("[ERROR]", e)
+            return None
+
+    def release(self):
+        self.sock.close()
+
 # import rclpy
 # from rclpy.node import Node
 # from sensor_msgs.msg import Image
@@ -116,6 +149,8 @@ def get_video_source(mode="camera"):
         return SocketSource('0.0.0.0', 9999)
     elif mode == "socket-client":
         return SocketClientSource('0.0.0.0', 9999)
+    elif mode == "udp-client":
+        return UDPSocketSource('0.0.0.0', 9999)
     # elif mode == "ros2":
     #     return ROS2ImageSource('/camera/image_raw')
     else:

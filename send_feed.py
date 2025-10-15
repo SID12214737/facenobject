@@ -50,5 +50,26 @@ def start_client():
             print(f"[ERROR] {e}")
             time.sleep(3)
 
+def udpclient():
+    DEST_IP = "195.158.8.218"
+    DEST_PORT = 9999
+    MAX_DGRAM = 2**16 - 64
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cap = cv2.VideoCapture(0)
+    print(f"[INFO] Sending to {DEST_IP}:{DEST_PORT}")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        _, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        data = pickle.dumps(encoded)
+
+        for i in range(0, len(data), MAX_DGRAM):
+            sock.sendto(data[i:i+MAX_DGRAM], (DEST_IP, DEST_PORT))
+        sock.sendto(b'FRAME_END', (DEST_IP, DEST_PORT))
+
+        time.sleep(0.03)
+
 if __name__ == "__main__":
-    start_client()
+    udpclient()
