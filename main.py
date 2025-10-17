@@ -3,117 +3,139 @@ import numpy as np
 from ultralytics.models import YOLO
 import insightface
 from insightface.app import FaceAnalysis
+import json
+import socket
+import time
+import os
+import math
 
 # --- Initialize YOLO (for objects and people)
-yolo = YOLO("yolov8n.pt")  # lightweight model, use yolov8m or l for more accuracy
+yolo = YOLO("yolov5n.pt")
+pose_model = YOLO("yolov8n-pose.pt")
 
 # --- Initialize InsightFace
-app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 # --- Build face embeddings database ---
-known_faces = {}
-known_images = {
-    "Mir": "faces/mir.jpg",
-}
+def load_known_faces(app, directory="faces"):
+    known_faces = {}
 
-for name, path in known_images.items():
-    img = cv2.imread(path)
-    faces = app.get(img)
-    if faces:
-        known_faces[name] = faces[0].embedding
+    # List all image files in directory
+    for filename in os.listdir(directory):
+        if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            name = os.path.splitext(filename)[0]  # get filename without extension
+            path = os.path.join(directory, filename)
+            img = cv2.imread(path)
 
-print(f"[INFO] Loaded {len(known_faces)} known faces.")
+            if img is None:
+                print(f"[WARN] Failed to read image: {path}")
+                continue
 
-def detect_blink(landmarks, prev_state=None):
-    # Using eye aspect ratio (EAR)
-    def eye_ratio(p):
-        A = np.linalg.norm(p[1] - p[5])
-        B = np.linalg.norm(p[2] - p[4])
-        C = np.linalg.norm(p[0] - p[3])
-        return (A + B) / (2.0 * C)
+            faces = app.get(img)
+            if faces:
+                known_faces[name] = faces[0].embedding
+                print(f"[INFO] Loaded face for {name}")
+            else:
+                print(f"[WARN] No face detected in {filename}")
 
-    left_eye = landmarks[36:42]
-    right_eye = landmarks[42:48]
-    ear = (eye_ratio(left_eye) + eye_ratio(right_eye)) / 2.0
-    return 1.0 if ear < 0.2 else 0.0
+    print(f"[INFO] Loaded {len(known_faces)} known faces total.")
+    return known_faces
 
+known_faces = load_known_faces(app, "faces")
 
-def texture_liveness(frame, bbox):
-    x1, y1, x2, y2 = map(int, bbox)
-    h, w = frame.shape[:2]
+def estimate_head_pose(landmarks_2d, frame_width, frame_height):
+    if landmarks_2d is None or len(landmarks_2d) < 5:
+        return None, None, None, "No landmarks"
 
-    # Clamp coordinates to frame bounds
-    x1 = max(0, min(x1, w - 1))
-    x2 = max(0, min(x2, w - 1))
-    y1 = max(0, min(y1, h - 1))
-    y2 = max(0, min(y2, h - 1))
+    model_points = np.array([
+        [-30.0, 40.0, 30.0],   # Left eye
+        [30.0, 40.0, 30.0],    # Right eye
+        [0.0, 0.0, 0.0],       # Nose tip
+        [-25.0, -40.0, 30.0],  # Left mouth corner
+        [25.0, -40.0, 30.0]    # Right mouth corner
+    ], dtype=np.float64)
 
-    # Skip invalid boxes
-    if x2 <= x1 or y2 <= y1:
-        return False
+    image_points = np.array(landmarks_2d, dtype=np.float64).reshape(-1, 2)
 
-    face = frame[y1:y2, x1:x2]
-    if face.size == 0:
-        return False
+    # Camera matrix
+    focal_length = frame_width
+    center = (frame_width / 2, frame_height / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype=np.float64)
 
-    # Convert to grayscale and compute texture variance
-    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-    # Adjust threshold based on experiments; ~100–150 is a good start
-    return lap_var > 120
+    # Pose estimation
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        model_points,
+        image_points,
+        camera_matrix,
+        dist_coeffs,
+        flags=cv2.SOLVEPNP_EPNP
+    )
 
-def color_liveness(face):
-    hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
-    mean_hue = np.mean(hsv[..., 0])
-    mean_sat = np.mean(hsv[..., 1])
-    return mean_sat > 40 and (10 < mean_hue < 170)
+    if not success:
+        return None, None, None, "Pose not found"
 
+    # Convert rotation vector to rotation matrix
+    rot_mat, _ = cv2.Rodrigues(rotation_vector)
 
-def liveness_check(frame, face, prev_state=None):
-    bbox = face.bbox.astype(int)
-    x1, y1, x2, y2 = np.clip(bbox, 0, [frame.shape[1]-1, frame.shape[0]-1, frame.shape[1]-1, frame.shape[0]-1])
-    if x2 <= x1 or y2 <= y1:
-        return 0.0
+    # Extract Euler angles (in degrees)
+    sy = math.sqrt(rot_mat[0, 0] ** 2 + rot_mat[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        pitch = math.degrees(math.atan2(rot_mat[2, 1], rot_mat[2, 2]))
+        yaw = math.degrees(math.atan2(-rot_mat[2, 0], sy))
+        roll = math.degrees(math.atan2(rot_mat[1, 0], rot_mat[0, 0]))
+    else:
+        pitch = math.degrees(math.atan2(-rot_mat[1, 2], rot_mat[1, 1]))
+        yaw = math.degrees(math.atan2(-rot_mat[2, 0], sy))
+        roll = 0
 
-    roi = frame[y1:y2, x1:x2]
-    if roi.size == 0:
-        return 0.0
+    description = []
+    if yaw > 15:
+        description.append("Looking Left")
+    elif yaw < -15:
+        description.append("Looking Right")
+    else:
+        description.append("Facing Forward")
 
-    # --- Texture cue ---
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    texture_score = np.tanh((lap_var - 80) / 60) * 0.5 + 0.5   # map to 0-1
+    if pitch > 10:
+        description.append("Looking Down")
+    elif pitch < -10:
+        description.append("Looking Up")
 
-    # --- Color cue ---
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    mean_sat = np.mean(hsv[..., 1])
-    mean_val = np.mean(hsv[..., 2])
-    color_score = np.clip((mean_sat - 30) / 50, 0, 1) * np.clip((mean_val - 80) / 80, 0, 1)
+    head_pose_desc = " & ".join(description)
 
-    # --- Blink / micro-motion cue ---
-    blink_score = 0.0
-    if hasattr(face, "landmark_3d_68") and face.landmark_3d_68 is not None:
-        blink_score = detect_blink(face.landmark_3d_68[:, :2], prev_state)
+    euler_angles = {"yaw": yaw, "pitch": pitch, "roll": roll}
 
-    # Weighted fusion
-    weights = np.array([0.5, 0.3, 0.2])
-    scores = np.array([texture_score, color_score, blink_score])
-    confidence = float(np.dot(weights, scores))
-
-    return confidence   # 0–1 float instead of bool
-
+    return rotation_vector, translation_vector, euler_angles, head_pose_desc
 
 def detect_faces_and_objects(frame):
-
     # Step 1: Run YOLO detection
     results = yolo(frame, verbose=False)
     detections = results[0].boxes.data.cpu().numpy()
 
+    # Detection summary list
+    detection_info = []
+
+    frame_h, frame_w = frame.shape[:2]
+    frame_center_x = frame_w / 2
+    frame_center_y = frame_h / 2
+
     for det in detections:
         x1, y1, x2, y2, conf, cls_id = det
         cls_name = yolo.names[int(cls_id)]
+        entry = {
+            "class": cls_name,
+            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+            "confidence": float(conf),
+            "extra": {}
+        }
 
         if cls_name in ["person", "face"]:
             # Crop the face/person region
@@ -123,6 +145,7 @@ def detect_faces_and_objects(frame):
 
             # Step 2: Run InsightFace recognition + liveness
             faces = app.get(crop)
+
             for f in faces:
                 # Compute similarity with known faces
                 name = "Unknown"
@@ -131,48 +154,109 @@ def detect_faces_and_objects(frame):
                     sim = np.dot(f.embedding, known_emb) / (
                         np.linalg.norm(f.embedding) * np.linalg.norm(known_emb)
                     )
-                    if sim > 0.4 and sim > max_sim:  # threshold for match
+                    if sim > 0.4 and sim > max_sim:
                         max_sim = sim
                         name = known_name
+                if DISPLAY:
+                    cv2.putText(frame, name, (int(x1), int(y1) - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Compute center of the detected person/face
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
 
-                # Simple liveness estimation
-                liveness_conf = liveness_check(frame, f, prev_state=None)
-                is_live = liveness_conf > 0.6
-                color = (0, 255, 0) if is_live else (0, 0, 255)
+                # Compare to frame center
+                dx = center_x - frame_center_x
+                dy = center_y - frame_center_y
 
-                # Draw bounding box & label
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                label = f"{name} {'| live:'} {liveness_conf:.2f}"
-                cv2.putText(frame, label, (int(x1), int(y1) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                # Directional description
+                horizontal = "center"
+                vertical = "center"
 
+                if dx < -frame_w * 0.1:
+                    horizontal = "left"
+                elif dx > frame_w * 0.1:
+                    horizontal = "right"
+
+                if dy < -frame_h * 0.1:
+                    vertical = "top"
+                elif dy > frame_h * 0.1:
+                    vertical = "bottom"
+
+                position_desc = f"{vertical}-{horizontal}"
+
+                
+                if hasattr(f, "kps"):
+                    rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame.shape[1], frame.shape[0])
+                    head_pose = {
+                        "angle-desc": desc,
+                        "angles": angles,
+                        # "rotation_vector": rot_vec.tolist(),
+                        # "translation_vector": trans_vec.tolist()
+                    }
+                else:
+                    head_pose = None
+
+                # Add to detection metadata
+                entry["extra"].update({
+                    "recognized-name": name,
+                    "similarity": float(max_sim),
+                    "position-desc": position_desc,
+                    # "liveness_conf": float(liveness_conf),
+                    # "is_live": bool(is_live),
+                    "head-pose": head_pose,
+                })
+            # if cls_name == "person":
+            #     crop = frame[int(y1):int(y2), int(x1):int(x2)]
+            #     pose_results = pose_model(crop)
+            #     for res in pose_results:
+            #         annotated = res.plot()
+            #         frame[int(y1):int(y2), int(x1):int(x2)] = annotated
         else:
-            # For other YOLO objects (car, cup, etc.)
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 2)
-            cv2.putText(frame, cls_name, (int(x1), int(y1) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-    return frame
+            # Other YOLO objects (car, cup, etc.)
+            if DISPLAY:
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 2)
+                cv2.putText(frame, cls_name, (int(x1), int(y1) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        detection_info.append(entry)
+
+    return frame, detection_info
+
+DISPLAY = True
 
 def main():
-    # --- Open webcam ---
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(2)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
+    prev_frame_time = time.time()
+    new_frame_time = 0
 
     while True:
-        for _ in range(3):  # discard buffered frames
+
+        for _ in range(0):  # discard buffered frames for low latency
             cap.grab()
 
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame = detect_faces_and_objects(frame)
+        frame, detections = detect_faces_and_objects(frame)
 
-        cv2.imshow("Face & Object Detection", frame)
+        new_frame_time = time.time()
+        fps = round(1 / (new_frame_time - prev_frame_time))
+        prev_frame_time = new_frame_time
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        ###
+        print(f"[FPS]{fps}")
+        print(f"[DETECTIONS] {detections}\n")
 
+        if DISPLAY:
+            cv2.putText(frame, f"fps: {fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+            cv2.imshow("Face & Object Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            
     cap.release()
     cv2.destroyAllWindows()
 
