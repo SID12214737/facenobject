@@ -8,14 +8,14 @@ import socket
 import time
 import os
 import math
+import threading
 
 # --- Initialize YOLO (for objects and people)
-yolo = YOLO("yolov5n.pt")
-pose_model = YOLO("yolov8n-pose.pt")
+yolo = YOLO("yolov5nu.pt")
 
 # --- Initialize InsightFace
 app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=0, det_size=(640, 640))
+app.prepare(ctx_id=0, det_size=(320, 320))
 
 # --- Build face embeddings database ---
 def load_known_faces(app, directory="faces"):
@@ -43,6 +43,12 @@ def load_known_faces(app, directory="faces"):
     return known_faces
 
 known_faces = load_known_faces(app, "faces")
+
+def register_new_person():
+    return
+
+def recognize_emotion():
+    return
 
 def estimate_head_pose(landmarks_2d, frame_width, frame_height):
     if landmarks_2d is None or len(landmarks_2d) < 5:
@@ -158,34 +164,32 @@ def detect_faces_and_objects(frame):
                         max_sim = sim
                         name = known_name
                 if DISPLAY:
-                    cv2.putText(frame, name, (int(x1), int(y1) - 10),
+                    cv2.putText(frame, name, (int(x1), int(y1) - 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 # Compute center of the detected person/face
                 center_x = (x1 + x2) / 2
                 center_y = (y1 + y2) / 2
 
-                # Compare to frame center
-                dx = center_x - frame_center_x
-                dy = center_y - frame_center_y
+                # Compute relative center offset (normalized)
+                dx = (center_x - frame_center_x) / ((x2 - x1) / 2)
+                dy = (center_y - frame_center_y) / ((y2 - y1) / 2)
 
-                # Directional description
                 horizontal = "center"
                 vertical = "center"
 
-                if dx < -frame_w * 0.1:
+                if dx < -1:
                     horizontal = "left"
-                elif dx > frame_w * 0.1:
+                elif dx > 1:
                     horizontal = "right"
 
-                if dy < -frame_h * 0.1:
+                if dy < -1:
                     vertical = "top"
-                elif dy > frame_h * 0.1:
+                elif dy > 1:
                     vertical = "bottom"
 
                 position_desc = f"{vertical}-{horizontal}"
 
-                
                 if hasattr(f, "kps"):
                     rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame.shape[1], frame.shape[0])
                     head_pose = {
@@ -202,31 +206,24 @@ def detect_faces_and_objects(frame):
                     "recognized-name": name,
                     "similarity": float(max_sim),
                     "position-desc": position_desc,
-                    # "liveness_conf": float(liveness_conf),
-                    # "is_live": bool(is_live),
                     "head-pose": head_pose,
                 })
-            # if cls_name == "person":
-            #     crop = frame[int(y1):int(y2), int(x1):int(x2)]
-            #     pose_results = pose_model(crop)
-            #     for res in pose_results:
-            #         annotated = res.plot()
-            #         frame[int(y1):int(y2), int(x1):int(x2)] = annotated
-        else:
-            # Other YOLO objects (car, cup, etc.)
-            if DISPLAY:
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 2)
-                cv2.putText(frame, cls_name, (int(x1), int(y1) - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+        if DISPLAY:
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 2)
+            cv2.putText(frame, cls_name, (int(x1), int(y1) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         detection_info.append(entry)
 
     return frame, detection_info
 
+
+# Set to True if wanna display output img
 DISPLAY = True
 
 def main():
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     prev_frame_time = time.time()
@@ -234,7 +231,7 @@ def main():
 
     while True:
 
-        for _ in range(0):  # discard buffered frames for low latency
+        for _ in range(0):
             cap.grab()
 
         ret, frame = cap.read()
@@ -252,7 +249,12 @@ def main():
         print(f"[DETECTIONS] {detections}\n")
 
         if DISPLAY:
-            cv2.putText(frame, f"fps: {fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+            cv2.putText(frame, f"fps: {fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+            for det in detections:
+                if det["class"] == "person" and det['extra']:
+                    cv2.putText(frame, f"head-position: {det['extra']['position-desc']}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 0), 2)
+                    cv2.putText(frame, f"head-pose: {det['extra']['head-pose']['angle-desc']}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 100), 2)
+                     
             cv2.imshow("Face & Object Detection", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
