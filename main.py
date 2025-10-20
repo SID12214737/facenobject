@@ -1,30 +1,26 @@
 import cv2
 import numpy as np
-from ultralytics.models import YOLO
 import insightface
 from insightface.app import FaceAnalysis
-import json
-import socket
 import time
 import os
 import math
-import threading
 
-# --- Initialize YOLO (for objects and people)
-yolo = YOLO("yolov5nu.pt")
+import pyrealsense2 as rs
 
-# --- Initialize InsightFace
+
+DISPLAY = True
+MAX_FACES = 3
+
 app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=0, det_size=(320, 320))
+app.prepare(ctx_id=0, det_size=(640, 640))
 
-# --- Build face embeddings database ---
 def load_known_faces(app, directory="faces"):
     known_faces = {}
 
-    # List all image files in directory
     for filename in os.listdir(directory):
         if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-            name = os.path.splitext(filename)[0]  # get filename without extension
+            name = os.path.splitext(filename)[0]  
             path = os.path.join(directory, filename)
             img = cv2.imread(path)
 
@@ -44,11 +40,6 @@ def load_known_faces(app, directory="faces"):
 
 known_faces = load_known_faces(app, "faces")
 
-def register_new_person():
-    return
-
-def recognize_emotion():
-    return
 
 def estimate_head_pose(landmarks_2d, frame_width, frame_height):
     if landmarks_2d is None or len(landmarks_2d) < 5:
@@ -122,146 +113,269 @@ def estimate_head_pose(landmarks_2d, frame_width, frame_height):
     return rotation_vector, translation_vector, euler_angles, head_pose_desc
 
 def detect_faces_and_objects(frame):
-    # Step 1: Run YOLO detection
-    results = yolo(frame, verbose=False)
-    detections = results[0].boxes.data.cpu().numpy()
 
-    # Detection summary list
     detection_info = []
 
     frame_h, frame_w = frame.shape[:2]
     frame_center_x = frame_w / 2
     frame_center_y = frame_h / 2
 
-    for det in detections:
-        x1, y1, x2, y2, conf, cls_id = det
-        cls_name = yolo.names[int(cls_id)]
+    faces = app.get(frame)
+
+    faces = sorted(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]), reverse=True)[:MAX_FACES]
+
+    for f in faces:
+        bbox = f.bbox.astype(int)
+        x1 = int(max(0, bbox[0]))
+        y1 = int(max(0, bbox[1]))
+        x2 = int(min(frame_w - 1, bbox[2]))
+        y2 = int(min(frame_h - 1, bbox[3]))
+
         entry = {
-            "class": cls_name,
-            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-            "confidence": float(conf),
-            "extra": {}
-        }
+                "class": 'person',
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "extra": {}
+            }
+        # Compute similarity with known faces
+        name = "Unknown"
+        max_sim = 0
+        for known_name, known_emb in known_faces.items():
+            sim = np.dot(f.embedding, known_emb) / (
+                np.linalg.norm(f.embedding) * np.linalg.norm(known_emb)
+            )
+            if sim > 0.4 and sim > max_sim:
+                max_sim = sim
+                name = known_name
+        if DISPLAY:
+            cv2.putText(frame, name, (int(x1), int(y1) - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Compute center of the detected person/face
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
 
-        if cls_name in ["person", "face"]:
-            # Crop the face/person region
-            crop = frame[int(y1):int(y2), int(x1):int(x2)]
-            if crop.size == 0:
-                continue
+        # Compute relative center offset (normalized)
+        dx = (center_x - frame_center_x) / ((x2 - x1) / 2)
+        dy = (center_y - frame_center_y) / ((y2 - y1) / 2)
 
-            # Step 2: Run InsightFace recognition + liveness
-            faces = app.get(crop)
+        horizontal = "center"
+        vertical = "center"
 
-            for f in faces:
-                # Compute similarity with known faces
-                name = "Unknown"
-                max_sim = 0
-                for known_name, known_emb in known_faces.items():
-                    sim = np.dot(f.embedding, known_emb) / (
-                        np.linalg.norm(f.embedding) * np.linalg.norm(known_emb)
-                    )
-                    if sim > 0.4 and sim > max_sim:
-                        max_sim = sim
-                        name = known_name
-                if DISPLAY:
-                    cv2.putText(frame, name, (int(x1), int(y1) - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # Compute center of the detected person/face
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
+        if dx < -1:
+            horizontal = "left"
+        elif dx > 1:
+            horizontal = "right"
 
-                # Compute relative center offset (normalized)
-                dx = (center_x - frame_center_x) / ((x2 - x1) / 2)
-                dy = (center_y - frame_center_y) / ((y2 - y1) / 2)
+        if dy < -1:
+            vertical = "top"
+        elif dy > 1:
+            vertical = "bottom"
 
-                horizontal = "center"
-                vertical = "center"
+        position_desc = f"{vertical}-{horizontal}"
 
-                if dx < -1:
-                    horizontal = "left"
-                elif dx > 1:
-                    horizontal = "right"
+        if hasattr(f, "kps"):
+            rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame.shape[1], frame.shape[0])
+            head_pose = {
+                "angle-desc": desc,
+                "angles": angles,
+            }
+        else:
+            head_pose = None
 
-                if dy < -1:
-                    vertical = "top"
-                elif dy > 1:
-                    vertical = "bottom"
-
-                position_desc = f"{vertical}-{horizontal}"
-
-                if hasattr(f, "kps"):
-                    rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame.shape[1], frame.shape[0])
-                    head_pose = {
-                        "angle-desc": desc,
-                        "angles": angles,
-                        # "rotation_vector": rot_vec.tolist(),
-                        # "translation_vector": trans_vec.tolist()
-                    }
-                else:
-                    head_pose = None
-
-                # Add to detection metadata
-                entry["extra"].update({
-                    "recognized-name": name,
-                    "similarity": float(max_sim),
-                    "position-desc": position_desc,
-                    "head-pose": head_pose,
-                })
+        # Add to detection metadata
+        entry["extra"].update({
+            "recognized-name": name,
+            "similarity": float(max_sim),
+            "position-desc": position_desc,
+            "head-pose": head_pose,
+        })
             
         if DISPLAY:
+            for (x, y) in f.kps:
+                cv2.circle(frame, (int(x), int(y)), 2, (0, 0, 255), -1)
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 2)
-            cv2.putText(frame, cls_name, (int(x1), int(y1) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         detection_info.append(entry)
 
     return frame, detection_info
 
-
-# Set to True if wanna display output img
-DISPLAY = True
+def send_frame():
+    
+    return
 
 def main():
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
+    # Configure depth and color streams
+    pipeline = rs.pipeline()
+    config = rs.config()
+
+    # Get device product line for setting a supporting resolution
+    pipeline_wrapper = rs.pipeline_wrapper(pipeline)
+    pipeline_profile = config.resolve(pipeline_wrapper)
+    device = pipeline_profile.get_device()
+
+    found_rgb = False
+    for s in device.sensors:
+        if s.get_info(rs.camera_info.name) == 'RGB Camera':
+            found_rgb = True
+            break
+    if not found_rgb:
+        print("Color sensor not found")
+        exit(0)
+
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+    # Start streaming
+    pipeline.start(config)
+
     prev_frame_time = time.time()
     new_frame_time = 0
 
-    while True:
+    try:
+        while True:
+            new_frame_time = time.time()
+            fps = round(1 / (new_frame_time - prev_frame_time))
+            prev_frame_time = new_frame_time
 
-        for _ in range(0):
-            cap.grab()
+            # Wait for a coherent pair of frames: depth and color
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
 
-        ret, frame = cap.read()
-        if not ret:
-            break
+            # Convert images to numpy arrays
+            color_image = np.asanyarray(color_frame.get_data())
 
-        frame, detections = detect_faces_and_objects(frame)
-
-        new_frame_time = time.time()
-        fps = round(1 / (new_frame_time - prev_frame_time))
-        prev_frame_time = new_frame_time
-
-        ###
-        print(f"[FPS]{fps}")
-        print(f"[DETECTIONS] {detections}\n")
-
-        if DISPLAY:
-            cv2.putText(frame, f"fps: {fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-            for det in detections:
-                if det["class"] == "person" and det['extra']:
-                    cv2.putText(frame, f"head-position: {det['extra']['position-desc']}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 0), 2)
-                    cv2.putText(frame, f"head-pose: {det['extra']['head-pose']['angle-desc']}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 100), 2)
-                     
-            cv2.imshow("Face & Object Detection", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            images, detections = detect_faces_and_objects(color_image)
             
-    cap.release()
-    cv2.destroyAllWindows()
+            print(f"[FPS]{fps}")
+            print(f"[DETECTIONS] {detections}\n")
 
+            if DISPLAY:
+                cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
+                cv2.putText(images, f"fps: {fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                
+                cv2.imshow('RealSense', images)
+            cv2.waitKey(1)
+
+    finally:
+
+        # Stop streaming
+        pipeline.stop()
+
+# server.py
+import asyncio
+import threading
+import time
+import cv2
+import os
+import numpy as np
+from aiohttp import web
+from av import VideoFrame
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+
+BASE_DIR = os.path.dirname(__file__)
+VIDEO_HEIGHT = 640
+VIDEO_WIDTH = 480
+VIDEO_FPS = 60
+
+cap = cv2.VideoCapture(0)  
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
+cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
+
+_latest_frame = None
+_frame_lock = threading.Lock()
+_running = True
+
+def capture_loop():
+    global _latest_frame, _running
+    while _running:
+        ret, frame = cap.read()
+        if ret:
+            with _frame_lock:
+                _latest_frame = frame.copy()
+        else:
+            time.sleep(0.01)
+
+t = threading.Thread(target=capture_loop, daemon=True)
+t.start()
+
+class BroadcastTrack(VideoStreamTrack):
+    
+    def __init__(self, fps=VIDEO_FPS):
+        super().__init__()
+        self._fps = fps
+        self._frame_time = 1.0 / fps
+        self._last_ts = None
+
+    async def recv(self):
+        if self._last_ts is None:
+            self._last_ts = time.time()
+        else:
+            elapsed = time.time() - self._last_ts
+            if elapsed < self._frame_time:
+                await asyncio.sleep(self._frame_time - elapsed)
+            self._last_ts = time.time()
+
+        with _frame_lock:
+            frame = _latest_frame.copy() if _latest_frame is not None else None
+
+        if frame is None:
+            # create a black frame if nothing is captured yet
+            frame = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
+
+        # Create an av.VideoFrame from numpy (OpenCV uses BGR)
+        video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
+        return video_frame
+
+broadcast_track = BroadcastTrack(fps=30)
+
+pcs = set()
+
+async def index(request):
+    html = open(os.path.join(BASE_DIR, "index.html"), "r").read()
+    return web.Response(content_type="text/html", text=html)
+
+async def offer(request):
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+    print("New PeerConnection:", pc)
+
+    pc.addTrack(broadcast_track)
+
+    @pc.on("connectionstatechange")
+    async def on_state_change():
+        print("Connection state:", pc.connectionState)
+        if pc.connectionState in ("failed", "closed"):
+            await pc.close()
+            pcs.discard(pc)
+
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+
+async def on_shutdown(app):
+    global _running
+    _running = False
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+    try:
+        cap.release()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    main()
+    app = web.Application()
+    app.on_shutdown.append(on_shutdown)
+    app.router.add_get("/", index)
+    app.router.add_post("/offer", offer)
+    web.run_app(app, host="0.0.0.0", port=8088)

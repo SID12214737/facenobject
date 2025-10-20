@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"/><title>Pi Camera</title></head>
+  <body>
+    <h3>Live camera (WebRTC)</h3>
+    <video id="remoteVideo" autoplay playsinline controls style="width:640px;height:480px;"></video>
+
+    <script>
+      const pc = new RTCPeerConnection();
+      pc.ontrack = (event) => {
+        const vid = document.getElementById("remoteVideo");
+        if (vid.srcObject !== event.streams[0]) {
+          vid.srcObject = event.streams[0];
+        }
+      };
+
+      async function start() {
+        // Create offer (we only receive video)
+        const offer = await pc.createOffer({offerToReceiveVideo: true});
+        await pc.setLocalDescription(offer);
+
+        const res = await fetch('/offer', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sdp: pc.localDescription.sdp, type: pc.localDescription.type})
+        });
+        const answer = await res.json();
+        await pc.setRemoteDescription(answer);
+      }
+
+      start().catch(console.error);
+    </script>
+  </body>
+</html>

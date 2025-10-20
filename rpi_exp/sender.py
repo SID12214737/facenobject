@@ -12,7 +12,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 BASE_DIR = os.path.dirname(__file__)
 VIDEO_HEIGHT = 640
 VIDEO_WIDTH = 480
-VIDEO_FPS = 29
+VIDEO_FPS = 60
 
 cap = cv2.VideoCapture(0)  
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
@@ -29,8 +29,6 @@ def capture_loop():
         ret, frame = cap.read()
         if ret:
             with _frame_lock:
-                cv2.putText(frame, "H", (10, 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255))
                 _latest_frame = frame.copy()
         else:
             time.sleep(0.01)
