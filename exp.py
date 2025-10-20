@@ -10,14 +10,18 @@ import threading
 
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
+DISPLAY = True
+MAX_FACES = 3
+
+
 # --- Initialize YOLO (for objects and people)
-yolo = YOLO("yolov5nu.pt")
+yolo = YOLO("yolov8n-face.pt")
 yolo.export(format="onnx", opset=12)
 
 
 # --- Initialize InsightFace
 app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=0, det_size=(320, 320))
+app.prepare(ctx_id=0, det_size=(160, 160))
 
 # --- Build face embeddings database ---
 def load_known_faces(app, directory="faces"):
@@ -125,7 +129,8 @@ def estimate_head_pose(landmarks_2d, frame_width, frame_height):
 
 def detect_faces_and_objects(frame):
     # Step 1: Run YOLO detection
-    results = yolo(frame, verbose=False)
+    results = yolo(frame, imgsz=480, verbose=False) 
+
     detections = results[0].boxes.data.cpu().numpy()
 
     # Detection summary list
@@ -137,6 +142,9 @@ def detect_faces_and_objects(frame):
 
     faces = app.get(frame)
 
+    # Sort faces by area (descending)
+    faces = sorted(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]), reverse=True)[:MAX_FACES]
+
     for f in faces:
         bbox = f.bbox.astype(int)
         x1 = bbox[0]
@@ -146,7 +154,6 @@ def detect_faces_and_objects(frame):
         entry = {
                 "class": 'person',
                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                # "confidence": float(f.confidence),
                 "extra": {}
             }
         # Compute similarity with known faces
@@ -214,9 +221,70 @@ def detect_faces_and_objects(frame):
 
     return frame, detection_info
 
+def realsense_cam_capture():
+    import pyrealsense2 as rs
+    # Configure depth and color streams
+    pipeline = rs.pipeline()
+    config = rs.config()
 
-# Set to True if wanna display output img
-DISPLAY = True
+    # Get device product line for setting a supporting resolution
+    pipeline_wrapper = rs.pipeline_wrapper(pipeline)
+    pipeline_profile = config.resolve(pipeline_wrapper)
+    device = pipeline_profile.get_device()
+    device_product_line = str(device.get_info(rs.camera_info.product_line))
+
+    found_rgb = False
+    for s in device.sensors:
+        if s.get_info(rs.camera_info.name) == 'RGB Camera':
+            found_rgb = True
+            break
+    if not found_rgb:
+        print("Color sensor not found")
+        exit(0)
+
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+    # Start streaming
+    pipeline.start(config)
+
+    prev_frame_time = time.time()
+    new_frame_time = 0
+
+    try:
+        while True:
+            new_frame_time = time.time()
+            fps = round(1 / (new_frame_time - prev_frame_time))
+            prev_frame_time = new_frame_time
+
+            # Wait for a coherent pair of frames: depth and color
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
+
+            # Convert images to numpy arrays
+            color_image = np.asanyarray(color_frame.get_data())
+
+            images, detections = detect_faces_and_objects(color_image)
+
+            print(f"[FPS]{fps}")
+            print(f"[DETECTIONS] {detections}\n")
+
+            if DISPLAY:
+                cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
+                cv2.putText(images, f"fps: {fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                
+                cv2.imshow('RealSense', images)
+                cv2.waitKey(1)
+
+    finally:
+
+        # Stop streaming
+        pipeline.stop()
+
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -260,4 +328,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    realsense_cam_capture()
