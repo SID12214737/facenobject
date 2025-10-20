@@ -13,7 +13,6 @@
           vid.srcObject = event.streams[0];
         }
       };
-
       async function start() {
         // Create offer (we only receive video)
         const offer = await pc.createOffer({offerToReceiveVideo: true});

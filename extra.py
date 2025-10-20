@@ -13,6 +13,7 @@ import pyrealsense2 as rs
 from aiohttp import web
 from av import VideoFrame
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+import aiohttp_cors
 
 # InsightFace
 import insightface
@@ -21,8 +22,8 @@ from insightface.app import FaceAnalysis
 # ---------------- Config ----------------
 DISPLAY = True
 MAX_FACES = 3
-VIDEO_WIDTH = 640
-VIDEO_HEIGHT = 480
+VIDEO_WIDTH = 1024
+VIDEO_HEIGHT = 768
 VIDEO_FPS = 30
 # ----------------------------------------
 
@@ -122,9 +123,9 @@ def estimate_head_pose(landmarks_2d, frame_width, frame_height):
     else:
         description.append("Tog'riga")
 
-    if pitch > 15:
+    if pitch > 150:
         description.append("Pastga")
-    elif pitch < -15:
+    elif pitch < -150:
         description.append("Tepaga")
     else:
         description.append("Tog'riga")
@@ -217,25 +218,40 @@ def detect_faces_and_objects(frame):
     return frame, detection_info
 
 # ---------- RealSense capture thread ----------
-def realsense_capture_loop():
+def realsense_capture_loop(realsense=False):
     global _latest_frame, _latest_detections, _running, _pipeline
     # Configure depth and color streams
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.color, VIDEO_WIDTH, VIDEO_HEIGHT, rs.format.bgr8, VIDEO_FPS)
+    if realsense:
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, VIDEO_WIDTH, VIDEO_HEIGHT, rs.format.bgr8, VIDEO_FPS)
 
-    profile = pipeline.start(config)
-    _pipeline = pipeline
-    print("[INFO] RealSense pipeline started.")
+        profile = pipeline.start(config)
+        _pipeline = pipeline
+        print("[INFO] RealSense pipeline started.")
+    else:
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        print("[INFO] USB camera pipeline started.")
+
 
     try:
         while _running:
-            frames = pipeline.wait_for_frames(timeout_ms=5000)
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                continue
-            color_image = np.asanyarray(color_frame.get_data())
+            if realsense:
+                frames = pipeline.wait_for_frames(timeout_ms=5000)
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+                color_image = np.asanyarray(color_frame.get_data())
+            else:
+                for _ in range(0):
+                    cap.grab()
 
+                ret, color_image = cap.read()
+                if not ret:
+                    break
+            
+            
             # run detection & annotation
             annotated, detections = detect_faces_and_objects(color_image)
 
@@ -308,7 +324,13 @@ async def index(request):
     return web.Response(content_type="text/html", text=html)
 
 async def offer(request):
-    params = await request.json()
+    try:
+        # Try to parse JSON from the request body
+        params = await request.json()
+    except json.JSONDecodeError:
+        # If the request had no JSON (e.g., empty body)
+        return web.Response(text="Invalid or empty JSON payload", status=400)
+
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
@@ -327,6 +349,7 @@ async def offer(request):
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
+    
     return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
 async def detections_handler(request):
@@ -353,13 +376,76 @@ async def on_shutdown(app):
     except Exception:
         pass
 
+# ---------- MJPEG video stream ----------
+async def mjpeg_handler(request):
+    """Serve MJPEG video stream."""
+    boundary = "frame"
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": f"multipart/x-mixed-replace; boundary={boundary}"
+        },
+    )
+    await response.prepare(request)
+
+    try:
+        while _running:
+            with _frame_lock:
+                frame = _latest_frame.copy() if _latest_frame is not None else None
+
+            if frame is None:
+                frame = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
+
+            _, jpeg = cv2.imencode(".jpg", frame)
+            data = jpeg.tobytes()
+
+            await response.write(
+                b"--" + boundary.encode() + b"\r\n"
+                + b"Content-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                + data
+                + b"\r\n"
+            )
+
+            await asyncio.sleep(1.0 / VIDEO_FPS)
+    except asyncio.CancelledError:
+        print("[INFO] MJPEG stream cancelled.")
+    except Exception as e:
+        print(f"[ERROR] MJPEG stream: {e}")
+    finally:
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+    return response
+
 # ---------- main server ----------
 if __name__ == "__main__":
     webapp = web.Application()
-    webapp.on_shutdown.append(on_shutdown)
-    webapp.router.add_get("/", index)
-    webapp.router.add_post("/offer", offer)
-    webapp.router.add_get("/detections", detections_handler)
 
+    cors = aiohttp_cors.setup(webapp, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*",
+        )
+    })
+
+    webapp.on_shutdown.append(on_shutdown)
+
+    resource = cors.add(webapp.router.add_resource("/offer"))
+    cors.add(resource.add_route("POST", offer))
+
+    resource = cors.add(webapp.router.add_resource("/video"))
+    cors.add(resource.add_route("GET", mjpeg_handler))
+
+    resource = cors.add(webapp.router.add_resource("/"))
+    cors.add(resource.add_route("GET", index))
+
+    resource = cors.add(webapp.router.add_resource("/detections"))
+    cors.add(resource.add_route("GET", detections_handler))
+    
     print("[INFO] Starting WebRTC server on 0.0.0.0:8088")
     web.run_app(webapp, host="0.0.0.0", port=8088)
