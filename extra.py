@@ -19,12 +19,16 @@ import aiohttp_cors
 import insightface
 from insightface.app import FaceAnalysis
 
+import onnxruntime as ort
+
 # ---------------- Config ----------------
 DISPLAY = True
 MAX_FACES = 3
 VIDEO_WIDTH = 1024
 VIDEO_HEIGHT = 768
 VIDEO_FPS = 30
+PROVIDERS = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
 # ----------------------------------------
 
 # Globals shared between threads
@@ -35,7 +39,7 @@ _running = True
 _pipeline = None                # real sense pipeline object to stop later
 
 # Initialize InsightFace
-app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
+app = FaceAnalysis(name='buffalo_sc', providers=PROVIDERS)
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 def load_known_faces(app, directory="faces"):
@@ -63,6 +67,37 @@ def load_known_faces(app, directory="faces"):
     return known_faces
 
 known_faces = load_known_faces(app, "faces")
+
+# --------- emotion prediction ---------
+sess_options = ort.SessionOptions()
+emotion_sess = ort.InferenceSession("emotion-ferplus-8.onnx", providers=PROVIDERS)
+input_name = emotion_sess.get_inputs()[0].name
+output_name = emotion_sess.get_outputs()[0].name
+emotions = ['neutral', 'happiness', 'surprise', 'sadness', 'anger', 'disgust', 'fear', 'contempt']
+
+def preprocess_face(img, size=(64, 64)):
+    # FER+ expects grayscale [0,255], mean-centered around 128, no scaling to [0,1]
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(img, size)
+    img = img.astype(np.float32)
+    img = img - 128.0  # mean centering
+    img = np.expand_dims(np.expand_dims(img, 0), 0)  # shape (1,1,64,64)
+    return img
+
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / e.sum(axis=1, keepdims=True)
+
+def predict_emotion(face_img):
+    if face_img is None or not isinstance(face_img, np.ndarray) or face_img.size == 0:
+        return "unknown"
+
+    img = preprocess_face(face_img)
+    preds = emotion_sess.run([output_name], {input_name: img})[0]
+    probs = softmax(preds)
+    emotion_id = int(np.argmax(probs))
+    return emotions[emotion_id]
+
 
 # ---------- pose estimation ----------
 def estimate_head_pose(landmarks_2d, frame_width, frame_height):
@@ -196,9 +231,29 @@ def detect_faces_and_objects(frame):
         else:
             head_pose = None
 
+        
+        x1, y1, x2, y2 = f.bbox.astype(int)
+
+        # Add small margin to include entire face
+        h, w = frame.shape[:2]
+        margin = 20
+        x1 = max(0, x1 - margin)
+        y1 = max(0, y1 - margin)
+        x2 = min(w, x2 + margin)
+        y2 = min(h, y2 + margin)
+
+        face_img = frame[y1:y2, x1:x2]
+
+        # Skip if face image is empty (invalid bbox)
+        if face_img.size == 0:
+            continue
+
+        emotion = predict_emotion(face_img)
+        
         entry["extra"].update({
             "recognized-name": name,
             "similarity": float(max_sim),
+            "emotion": emotion,
             "position-desc": position_desc,
             "head-pose": head_pose
         })

@@ -108,6 +108,7 @@ import insightface
 from insightface.app import FaceAnalysis
 
 from ultralytics.models import YOLO
+import onnxruntime as ort
 
 # ---------------- Headless / Config ----------------
 def _is_headless():
@@ -115,10 +116,13 @@ def _is_headless():
 
 HEADLESS = _is_headless()
 DISPLAY = True if HEADLESS else True 
-MAX_FACES = 10
+MAX_FACES = 5
+MAX_OBJECTS = 5
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
 VIDEO_FPS = 30
+PROVIDERS = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
 # ----------------------------------------
 
 # Globals shared between threads
@@ -132,7 +136,7 @@ yolo = YOLO("yolov8n.pt")
 yolo.export(format="onnx", opset=12)
 
 # ---------- InsightFace init ----------
-app = FaceAnalysis(name='buffalo_sc', providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider'])
+app = FaceAnalysis(name='buffalo_sc', providers=PROVIDERS)
 # det_size gives better accuracy vs default
 app.prepare(ctx_id=0, det_size=(640, 640))
 
@@ -161,6 +165,48 @@ def load_known_faces(app, directory="faces"):
     return known_faces
 
 known_faces = load_known_faces(app, "faces")
+
+# --------- emotion prediction ---------
+sess_options = ort.SessionOptions()
+# emotion-deection model download link
+# https://huggingface.co/webml/models-moved/resolve/0e73dc31942fbdbbd135d85be5e5321eee88a826/emotion-ferplus-8.onnx?download=true
+emotion_sess = ort.InferenceSession("emotion-ferplus-8.onnx", providers=PROVIDERS)
+input_name = emotion_sess.get_inputs()[0].name
+output_name = emotion_sess.get_outputs()[0].name
+emotions = ['neutral', 'happiness', 'surprise', 'sadness', 'anger', 'disgust', 'fear', 'contempt']
+emotions = [
+    "neytral",      # neutral  
+    "xursand",      # happiness  
+    "hayrat",       # surprise  
+    "xafa",         # sadness  
+    "g'azab",       # anger  
+    "jirkanch",     # disgust  
+    "qo'rquv",      # fear  
+    "mensimaslik"   # contempt
+]
+
+def preprocess_face(img, size=(64, 64)):
+    # FER+ expects grayscale [0,255], mean-centered around 128, no scaling to [0,1]
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(img, size)
+    img = img.astype(np.float32)
+    img = img - 128.0  # mean centering
+    img = np.expand_dims(np.expand_dims(img, 0), 0)  # shape (1,1,64,64)
+    return img
+
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / e.sum(axis=1, keepdims=True)
+
+def predict_emotion(face_img):
+    if face_img is None or not isinstance(face_img, np.ndarray) or face_img.size == 0:
+        return "unknown"
+
+    img = preprocess_face(face_img)
+    preds = emotion_sess.run([output_name], {input_name: img})[0]
+    probs = softmax(preds)
+    emotion_id = int(np.argmax(probs))
+    return emotions[emotion_id]
 
 # ---------- pose estimation ----------
 def estimate_head_pose(landmarks_2d, frame_width, frame_height):
@@ -212,9 +258,9 @@ def estimate_head_pose(landmarks_2d, frame_width, frame_height):
     else:
         description.append("Tog'riga")
 
-    if pitch > 150:
+    if pitch > 15:
         description.append("Pastga")
-    elif pitch < -150:
+    elif pitch < -15:
         description.append("Tepaga")
     else:
         description.append("Tog'riga")
@@ -275,12 +321,31 @@ def detect_faces_and_objects(frame):
             rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame_w, frame_h)
             head_pose = {"angle-desc": desc, "angles": angles}
 
+        x1, y1, x2, y2 = f.bbox.astype(int)
+
+        # Add small margin to include entire face
+        h, w = frame.shape[:2]
+        margin = 20
+        x1 = max(0, x1 - margin)
+        y1 = max(0, y1 - margin)
+        x2 = min(w, x2 + margin)
+        y2 = min(h, y2 + margin)
+
+        face_img = frame[y1:y2, x1:x2]
+
+        # Skip if face image is empty (invalid bbox)
+        if face_img.size == 0:
+            continue
+        emotion = predict_emotion(face_img)
+
+
         entry = {
             "class": "face",
             "bbox": [x1, y1, x2, y2],
             "extra": {
                 "recognized-name": name,
                 "similarity": float(max_sim),
+                "emotion": emotion,
                 "position-desc": position_desc,
                 "head-pose": head_pose
             }
@@ -288,7 +353,7 @@ def detect_faces_and_objects(frame):
         detection_info.append(entry)
 
         if DISPLAY:
-            cv2.putText(frame, f"{name}", (x1, max(10, y1 - 10)),
+            cv2.putText(frame, f"{name} | {emotion}", (x1, max(10, y1 - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
             for (x, y) in getattr(f, "kps", []):
                 cv2.circle(frame, (int(x), int(y)), 2, (0, 0, 255), -1)
@@ -298,7 +363,7 @@ def detect_faces_and_objects(frame):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 1)
 
     # --- Step 2: Draw non-person objects from YOLO
-    for det in detections:
+    for det in detections[:MAX_OBJECTS]:
         x1, y1, x2, y2, conf, cls_id = det
         cls_name = yolo.names[int(cls_id)]
         if cls_name not in ["person", "face"]:
@@ -518,10 +583,22 @@ async def offer(request):
     await pc.setLocalDescription(answer)
     return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
+def to_serializable(obj):
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)  # fallback
+
 async def detections_handler(request):
     with _frame_lock:
         data = _latest_detections.copy() if _latest_detections is not None else []
-    return web.Response(content_type="application/json", text=json.dumps(data))
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps(data, default=to_serializable)
+    )
 
 async def on_shutdown(app):
     global _running, _pipeline

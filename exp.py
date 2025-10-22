@@ -17,70 +17,43 @@ import pyrealsense2 as rs
 DISPLAY = True
 MAX_FACES = 3
 
+PROVIDERS = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
 # yolo = YOLO("yolov8n-face.pt")
 # yolo.export(format="onnx", opset=12)
 
-app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
+app = FaceAnalysis(name='buffalo_sc', providers=PROVIDERS)
 app.prepare(ctx_id=0, det_size=(640, 640))
 
-
 sess_options = ort.SessionOptions()
-sess_options.intra_op_num_threads = 4   # or number of cores you have
-sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
-emotion_sess = ort.InferenceSession("emotion-ferplus-8.onnx", sess_options, providers=['CPUExecutionProvider'])
+emotion_sess = ort.InferenceSession("emotion-ferplus-8.onnx", providers=PROVIDERS)
 input_name = emotion_sess.get_inputs()[0].name
 output_name = emotion_sess.get_outputs()[0].name
 emotions = ['neutral', 'happiness', 'surprise', 'sadness', 'anger', 'disgust', 'fear', 'contempt']
 
+def preprocess_face(img, size=(64, 64)):
+    # FER+ expects grayscale [0,255], mean-centered around 128, no scaling to [0,1]
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(img, size)
+    img = img.astype(np.float32)
+    img = img - 128.0  # mean centering
+    img = np.expand_dims(np.expand_dims(img, 0), 0)  # shape (1,1,64,64)
+    return img
+
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / e.sum(axis=1, keepdims=True)
 
 def predict_emotion(face_img):
-    # Defensive checks: ensure we have a valid image region
-    if face_img is None:
-        print("[EMOTION] empty face_img is None")
+    if face_img is None or not isinstance(face_img, np.ndarray) or face_img.size == 0:
         return "unknown"
 
-    if not isinstance(face_img, np.ndarray) or face_img.size == 0:
-        print("[EMOTION] invalid face_img shape:", None if face_img is None else getattr(face_img, "shape", "no-shape"))
-        return "unknown"
-
-    # Ensure ROI has at least a minimal size; if tiny, resize with INTER_LINEAR after padding
-    h, w = face_img.shape[:2]
-    if h < 2 or w < 2:
-        print(f"[EMOTION] tiny ROI ({w}x{h}), skipping")
-        return "unknown"
-
-    try:
-        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-    except Exception as e:
-        print("[EMOTION] cvtColor failed:", e, "shape:", face_img.shape)
-        return "unknown"
-
-    # optional debug: show the cropped face (only if DISPLAY True and a UI is present)
-    # if DISPLAY:
-    #     try:
-    #         cv2.imshow("emotion_roi", gray)
-    #         cv2.waitKey(1)
-    #     except Exception as e:
-    #         print("[EMOTION] imshow failed:", e)
-
-    try:
-        resized = cv2.resize(gray, (64, 64)).astype(np.float32)
-    except Exception as e:
-        print("[EMOTION] resize failed:", e, "gray shape:", gray.shape)
-        return "unknown"
-
-    resized = (resized / 255.0).astype(np.float32)
-    resized = np.expand_dims(np.expand_dims(resized, 0), 0)
-    try:
-        preds = emotion_sess.run([output_name], {input_name: resized})[0][0]
-    except Exception as e:
-        print("[EMOTION] model run failed:", e)
-        return "unknown"
-
-    # debug: print probabilities shape and top value
-    print("[EMOTION] preds shape:", preds.shape, "top:", np.max(preds))
-    return emotions[int(np.argmax(preds))]
-
+    img = preprocess_face(face_img)
+    preds = emotion_sess.run([output_name], {input_name: img})[0]
+    probs = softmax(preds)
+    emotion_id = int(np.argmax(probs))
+    print(f"[EMOTION] {emotions[emotion_id]} ({probs[0, emotion_id]:.2f})")
+    return emotions[emotion_id]
 
 def load_known_faces(app, directory="faces"):
     known_faces = {}
@@ -109,7 +82,6 @@ known_faces = load_known_faces(app, "faces")
 
 def register_new_person():
     return
-
 
 def estimate_head_pose(landmarks_2d, frame_width, frame_height):
     if landmarks_2d is None or len(landmarks_2d) < 5:
