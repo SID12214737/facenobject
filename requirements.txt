@@ -1,9 +1,18 @@
-numpy
-opencv-python
-pyrealsense2
-aiohttp
-aiortc
-aiohttp-cors
-av
-insightface
-onnxruntime
+# Core numerical / vision
+numpy>=1.24
+opencv-python>=4.7
+
+# WebRTC / HTTP
+aiohttp>=3.8
+aiohttp-cors>=0.7.0
+aiortc>=1.6.0
+av>=10.0.0
+
+# ML / models
+insightface>=0.7.2
+ultralytics>=8.0.0
+onnxruntime>=1.15.0
+
+# PyTorch (required by ultralytics / some model ops)
+torch>=1.13.0
+torchvision>=0.14.0
