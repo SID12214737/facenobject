@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# main.py
+
 import os
 import time
 import math
@@ -8,36 +10,84 @@ import asyncio
 import sqlite3
 import pickle
 from datetime import datetime
+import logging
+from logging.handlers import RotatingFileHandler
+import sys
 
+# ---------------- Logging Setup ----------------
+def setup_logger(name, log_file=None, level=logging.INFO):
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    if log_file:
+        try:
+            file_handler = RotatingFileHandler(
+                log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except Exception as e:
+            print(f"Warning: Could not set up file logging: {e}")
+    
+    return logger
+
+BASE_DIR = os.path.dirname(__file__)
+EXTRA_LOG = os.path.join(BASE_DIR, "main.log")
+logger = setup_logger("main", EXTRA_LOG)
+
+# ---------------- Display & X11 setup ----------------
+HOST = '0.0.0.0'
+PORT = 8088
+
+# ---------------- Display & X11 setup ----------------
+display_from_env = os.environ.get("EXTRA_DISPLAY", ":0")
+os.environ.setdefault("DISPLAY", display_from_env)
+
+xauth_path = os.environ.get("EXTRA_XAUTHORITY")
+if xauth_path and os.path.exists(xauth_path):
+    os.environ["XAUTHORITY"] = xauth_path
+
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 # Silence Albumentations auto-update nag BEFORE anything may import it
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
-import cv2
-import numpy as np
-import pyrealsense2 as rs
-
-from aiohttp import web
-from av import VideoFrame
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-import aiohttp_cors
-
-# InsightFace
-import insightface
-from insightface.app import FaceAnalysis
+# ---------------- Imports ----------------
+try:
+    import cv2
+    import numpy as np
+    import pyrealsense2 as rs
+    from aiohttp import web
+    from av import VideoFrame
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    import aiohttp_cors
+    import insightface
+    from insightface.app import FaceAnalysis
+except ImportError as e:
+    logger.error(f"Import failed: {e}", exc_info=True)
+    raise
 
 # ---------------- Headless / Config ----------------
 def _is_headless():
     return not any(os.environ.get(var) for var in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET"))
 
 HEADLESS = _is_headless()
-DISPLAY = True if HEADLESS else True
+DISPLAY = not HEADLESS # we want this True!
 MAX_FACES = 5
-MAX_OBJECTS = 5
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
 VIDEO_FPS = 30
-PROVIDERS = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+# PROVIDERS = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
 
 # ----------------------------------------
 
@@ -50,11 +100,16 @@ _pipeline = None                # RealSense pipeline object to stop later
 
 
 # ---------- InsightFace init ----------
-app = FaceAnalysis(name='buffalo_sc', providers=PROVIDERS)
-# det_size gives better accuracy vs default
-app.prepare(ctx_id=0, det_size=(640, 640))
+try:
+    app = FaceAnalysis(name='buffalo_sc', providers=PROVIDERS)
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    logger.info("FaceAnalysis initialized")
+except Exception as e:
+    logger.error(f"FaceAnalysis initialization failed: {e}", exc_info=True)
+    raise
 
-# ========== FACE DATABASE MANAGEMENT ==========
+
+# ---------- Face DB Manager ----------
 class FaceEmbeddingDatabase:
     """
     Lightweight face recognition using InsightFace embeddings
@@ -232,7 +287,11 @@ class FaceEmbeddingDatabase:
 
 
 # Initialize face database
-face_db = FaceEmbeddingDatabase('faces.db')
+try:
+    face_db = FaceEmbeddingDatabase('faces.db')
+    logger.info("FaceDB initialized")
+except Exception as e:
+    logger.error(f"FaceDB initialization failed: {e}", exc_info=True)
 
 # Track unknown faces temporarily
 unknown_faces = {}  # {unknown_id: embedding}
@@ -306,114 +365,117 @@ def detect_faces_and_objects(frame):
     frame_h, frame_w = frame.shape[:2]
     frame_center_x = frame_w / 2
     frame_center_y = frame_h / 2
+    try:
+        # --- Step 1: Run InsightFace on the full frame once
+        faces = app.get(frame)
+        faces = sorted(
+            faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]),
+            reverse=True
+        )[:MAX_FACES]
 
-    # --- Step 1: Run InsightFace on the full frame once
-    faces = app.get(frame)
-    faces = sorted(
-        faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]),
-        reverse=True
-    )[:MAX_FACES]
+        for f in faces:
+            bbox = f.bbox.astype(int)
+            x1, y1, x2, y2 = map(int, bbox)
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(frame_w - 1, x2); y2 = min(frame_h - 1, y2)
 
-    for f in faces:
-        bbox = f.bbox.astype(int)
-        x1, y1, x2, y2 = map(int, bbox)
-        x1 = max(0, x1); y1 = max(0, y1)
-        x2 = min(frame_w - 1, x2); y2 = min(frame_h - 1, y2)
+            # Try to recognize face using database
+            name = "Aniqlanmagan"
+            face_id = None
+            max_sim = 0.0
 
-        # Try to recognize face using database
-        name = "Aniqlanmagan"
-        face_id = None
-        max_sim = 0.0
+            if getattr(f, "embedding", None) is not None:
+                db_face_id, db_name, similarity = face_db.recognize_face(f.embedding, tolerance=0.4)
 
-        if getattr(f, "embedding", None) is not None:
-            db_face_id, db_name, similarity = face_db.recognize_face(f.embedding, tolerance=0.4)
+                if db_face_id is not None:
+                    # Known face from database
+                    name = db_name
+                    face_id = db_face_id
+                    max_sim = similarity
+                    face_db.update_last_seen(face_id)
+                else:
+                    # Unknown face - assign temporary ID
+                    # Check if this embedding matches any stored unknown face
+                    matched_unknown = False
+                    for unk_id, unk_emb in list(unknown_faces.items()):
+                        sim = float(np.dot(f.embedding, unk_emb) /
+                                (np.linalg.norm(f.embedding) * np.linalg.norm(unk_emb)))
+                        if sim > 0.5:  # Higher threshold for unknown matching
+                            name = f"Unknown #{unk_id}"
+                            matched_unknown = True
+                            break
 
-            if db_face_id is not None:
-                # Known face from database
-                name = db_name
-                face_id = db_face_id
-                max_sim = similarity
-                face_db.update_last_seen(face_id)
-            else:
-                # Unknown face - assign temporary ID
-                # Check if this embedding matches any stored unknown face
-                matched_unknown = False
-                for unk_id, unk_emb in list(unknown_faces.items()):
-                    sim = float(np.dot(f.embedding, unk_emb) /
-                               (np.linalg.norm(f.embedding) * np.linalg.norm(unk_emb)))
-                    if sim > 0.5:  # Higher threshold for unknown matching
-                        name = f"Unknown #{unk_id}"
-                        matched_unknown = True
-                        break
+                    if not matched_unknown:
+                        # New unknown face
+                        unknown_faces[unknown_id_counter] = f.embedding.copy()
+                        name = f"Unknown #{unknown_id_counter}"
+                        unknown_id_counter += 1
 
-                if not matched_unknown:
-                    # New unknown face
-                    unknown_faces[unknown_id_counter] = f.embedding.copy()
-                    name = f"Unknown #{unknown_id_counter}"
-                    unknown_id_counter += 1
+            # position in frame
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            dx = (center_x - frame_center_x) / ((x2 - x1) / 2 + 1e-6)
+            dy = (center_y - frame_center_y) / ((y2 - y1) / 2 + 1e-6)
 
-        # position in frame
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
-        dx = (center_x - frame_center_x) / ((x2 - x1) / 2 + 1e-6)
-        dy = (center_y - frame_center_y) / ((y2 - y1) / 2 + 1e-6)
+            horizontal = "center"
+            vertical = "center"
+            if dx < -1: horizontal = "left"
+            elif dx > 1: horizontal = "right"
+            if dy < -1: vertical = "top"
+            elif dy > 1: vertical = "bottom"
+            position_desc = f"{vertical}-{horizontal}"
 
-        horizontal = "center"
-        vertical = "center"
-        if dx < -1: horizontal = "left"
-        elif dx > 1: horizontal = "right"
-        if dy < -1: vertical = "top"
-        elif dy > 1: vertical = "bottom"
-        position_desc = f"{vertical}-{horizontal}"
+            # head pose estimation
+            head_pose = None
+            if hasattr(f, "kps") and f.kps is not None and len(f.kps) >= 5:
+                rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame_w, frame_h)
+                head_pose = {"angle-desc": desc, "angles": angles}
 
-        # head pose estimation
-        head_pose = None
-        if hasattr(f, "kps") and f.kps is not None and len(f.kps) >= 5:
-            rot_vec, trans_vec, angles, desc = estimate_head_pose(f.kps, frame_w, frame_h)
-            head_pose = {"angle-desc": desc, "angles": angles}
+            x1, y1, x2, y2 = f.bbox.astype(int)
 
-        x1, y1, x2, y2 = f.bbox.astype(int)
+            # Add small margin to include entire face
+            h, w = frame.shape[:2]
+            margin = 5
+            x1 = max(0, x1 - margin)
+            y1 = max(0, y1 - margin)
+            x2 = min(w, x2 + margin)
+            y2 = min(h, y2 + margin)
 
-        # Add small margin to include entire face
-        h, w = frame.shape[:2]
-        margin = 20
-        x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
-        x2 = min(w, x2 + margin)
-        y2 = min(h, y2 + margin)
-
-        entry = {
-            "class": "face",
-            "bbox": [x1, y1, x2, y2],
-            "extra": {
-                "recognized-name": name,
-                "face-id": face_id,
-                "similarity": float(max_sim), # type: ignore
-                "position-desc": position_desc,
-                "head-pose": head_pose
+            entry = {
+                "class": "face",
+                "bbox": [x1, y1, x2, y2],
+                "extra": {
+                    "recognized-name": name,
+                    "face-id": face_id,
+                    "similarity": float(max_sim), # type: ignore
+                    "position-desc": position_desc,
+                    "head-pose": head_pose
+                }
             }
-        }
-        detection_info.append(entry)
+            detection_info.append(entry)
 
-        if DISPLAY:
-            # Choose color based on recognition status
-            if "Unknown" in name: # type: ignore
-                color = (255, 50, 50)  # Red for unknown
-            else:
-                color = (0, 255, 0)  # Green for known
+            if DISPLAY:
+                # Choose color based on recognition status
+                if "Unknown" in name: # type: ignore
+                    color = (255, 50, 50)  # Red for unknown
+                else:
+                    color = (0, 255, 0)  # Green for known
 
-            label = f"{name}"
-            if face_id:
-                label = f"ID:{face_id} {name}"
+                label = f"{name}"
+                if face_id:
+                    label = f"ID:{face_id} {name}"
 
-            cv2.putText(frame, label, (x1, max(10, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
-            for (x, y) in getattr(f, "kps", []):
-                cv2.circle(frame, (int(x), int(y)), 2, (0, 0, 255), -1)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            # if head_pose is not None:
-            #     cv2.putText(frame, head_pose["angle-desc"], (x1, y2 + 20),
-            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 1)
+                cv2.putText(frame, label, (x1, max(10, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+                for (x, y) in getattr(f, "kps", []):
+                    cv2.circle(frame, (int(x), int(y)), 2, (0, 0, 255), -1)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                # if head_pose is not None:
+                #     cv2.putText(frame, head_pose["angle-desc"], (x1, y2 + 20),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 1)
+
+    except Exception as e:
+        logger.error(f"Detection error: {e}", exc_info=True)
 
     return frame, detection_info
 
@@ -564,43 +626,43 @@ def command_handler():
             print(f"[ERROR] Command error: {e}")
 
 # ---------- RealSense capture thread ----------
-def realsense_capture_loop(realsense=False):
+def realsense_capture_loop(realsense=True):
     global _latest_frame, _latest_detections, _running, _pipeline
     pipeline = None
     cap = None
+    
     try:
         if realsense:
-            ctx = rs.context()
-            if len(ctx.devices) == 0:
-                print("[WARN] No RealSense device found; falling back to USB camera.")
-                realsense = False
-            else:
-                dev = ctx.devices[0]
-                try:
-                    name = dev.get_info(rs.camera_info.name)
-                except Exception:
-                    name = "RealSense"
-                print(f"[INFO] Using RealSense: {name}")
-                pipeline = rs.pipeline()
-                config = rs.config()
-
-                prof = _pick_color_profile(dev, desired_fps=VIDEO_FPS)
-                if prof is not None:
-                    v = prof.as_video_stream_profile()
-                    config.enable_stream(rs.stream.color, VIDEO_WIDTH, VIDEO_HEIGHT, rs.format.bgr8, v.fps())
+            try:
+                ctx = rs.context()
+                if len(ctx.devices) == 0:
+                    logger.info("No RealSense device found, using USB camera")
+                    realsense = False
                 else:
-                    # Let SDK auto-pick a valid color mode at desired FPS
-                    config.enable_stream(rs.stream.color, 0, 0, rs.format.bgr8, VIDEO_FPS)
-
-                try:
+                    dev = ctx.devices[0]
+                    try:
+                        name = dev.get_info(rs.camera_info.name)
+                    except Exception:
+                        name = "RealSense"
+                    logger.info(f"Using camera: {name}")
+                    
+                    pipeline = rs.pipeline()
+                    config = rs.config()
+                    prof = _pick_color_profile(dev, desired_fps=VIDEO_FPS)
+                    if prof is not None:
+                        v = prof.as_video_stream_profile()
+                        config.enable_stream(rs.stream.color, VIDEO_WIDTH, VIDEO_HEIGHT, rs.format.bgr8, v.fps())
+                    else:
+                        config.enable_stream(rs.stream.color, 0, 0, rs.format.bgr8, VIDEO_FPS)
+                    
                     profile = pipeline.start(config)
                     _pipeline = pipeline
-                    print("[INFO] RealSense pipeline started.")
-                except Exception as e:
-                    print(f"[WARN] RealSense start failed ({e}); falling back to USB camera.")
-                    realsense = False
-                    pipeline = None
-                    _pipeline = None
+                    logger.info("Capture started")
+            except Exception as e:
+                logger.warning(f"RealSense initialization failed: {e}, using USB camera")
+                realsense = False
+                pipeline = None
+                _pipeline = None
 
         if not realsense:
             cap = cv2.VideoCapture(0)
@@ -610,7 +672,7 @@ def realsense_capture_loop(realsense=False):
             cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
             if not cap.isOpened():
                 raise RuntimeError("USB camera could not be opened.")
-            print("[INFO] USB camera pipeline started.")
+            logger.info("USB camera pipeline started. Capture started")
 
         while _running:
             if pipeline is not None:
@@ -622,7 +684,7 @@ def realsense_capture_loop(realsense=False):
             else:
                 ret, color_image = cap.read()
                 if not ret:
-                    print("[WARN] USB camera read failed; retrying...")
+                    logger.warning("USB camera read failed; retrying...")
                     time.sleep(0.01)
                     continue
 
@@ -646,7 +708,7 @@ def realsense_capture_loop(realsense=False):
                     pass
 
     except Exception as e:
-        print(f"[ERROR] RealSense capture loop exception: {e}")
+        logger.error(f"Capture loop error: {e}", exc_info=True)
     finally:
         try:
             if pipeline is not None:
@@ -670,9 +732,9 @@ def realsense_capture_loop(realsense=False):
 _capture_thread = threading.Thread(target=realsense_capture_loop, daemon=True)
 _capture_thread.start()
 
-# Start command handler thread
-_command_thread = threading.Thread(target=command_handler, daemon=True)
-_command_thread.start()
+# Start command handler thread (only when u need pls. Save threads!)
+# _command_thread = threading.Thread(target=command_handler, daemon=True)
+# _command_thread.start()
 
 # ---------- WebRTC broadcast track ----------
 class BroadcastTrack(VideoStreamTrack):
@@ -809,9 +871,9 @@ async def mjpeg_handler(request):
 
             await asyncio.sleep(1.0 / VIDEO_FPS)
     except asyncio.CancelledError:
-        print("[INFO] MJPEG stream cancelled.")
+        pass
     except Exception as e:
-        print(f"[ERROR] MJPEG stream: {e}")
+        logger.error(f"MJPEG error: {e}", exc_info=True)
     finally:
         try:
             await response.write_eof()
@@ -1010,5 +1072,5 @@ if __name__ == "__main__":
     resource = cors.add(webapp.router.add_resource("/detections"))
     cors.add(resource.add_route("GET", detections_handler))
 
-    print("[INFO] Starting WebRTC server on 0.0.0.0:8088")
-    web.run_app(webapp, host="0.0.0.0", port=8088)
+    logger.info(f"Starting WebRTC server on {HOST}:{PORT}")
+    web.run_app(webapp, host=HOST, port=PORT)
