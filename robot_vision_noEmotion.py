@@ -892,7 +892,6 @@ async def register_name(request):
         unknown_id = int(data.get("unknown_id"))
         name = data.get("name", "").strip()
         
-        print('here')
         if not name:
             return web.json_response(
                 {"success": False, "error": "Name cannot be empty"},
@@ -900,7 +899,6 @@ async def register_name(request):
             )
         
         if unknown_id not in unknown_faces:
-            print(unknown_id)
             return web.json_response(
                 {"success": False, "error": f"Unknown ID {unknown_id} not found",
                  "available_ids": list(unknown_faces.keys())},
@@ -1051,7 +1049,7 @@ if __name__ == "__main__":
     resource = cors.add(webapp.router.add_resource("/offer"))
     cors.add(resource.add_route("POST", offer))
 
-    resource = cors.add(webapp.router.add_resource("/ragister-name"))
+    resource = cors.add(webapp.router.add_resource("/register-name"))
     cors.add(resource.add_route("POST", register_name))
 
     resource = cors.add(webapp.router.add_resource("/remove-name"))
